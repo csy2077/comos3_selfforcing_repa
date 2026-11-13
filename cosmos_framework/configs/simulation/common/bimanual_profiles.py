@@ -244,3 +244,26 @@ def make_local_bimanual_experiment(stage: int) -> dict[str, Any]:
     )
     experiment["trainer"]["callbacks"]["local_simulation_resume"] = L(LocalSimulationResumeCallback)()
     return experiment
+
+
+REPA_STAGE3_EXPERIMENT_NAME = "sim_local_bimanual_stage3_sfdmd_repa"
+REPA_ENCODER = "${oc.env:COSMOS_SIM_BIMANUAL_REPA_ENCODER}"
+
+
+def make_local_bimanual_stage3_repa_experiment() -> dict[str, Any]:
+    """Local Stage 3 plus REPA: token-relation distillation of the student's layer-20 generation
+    tokens against frozen OmniStream features of the real video (weight 0.5, as in
+    causal_forcing_repa_robotics). Everything else is the Stage 3 recipe unchanged."""
+    experiment = make_local_bimanual_experiment(3)
+    experiment["job"]["name"] = REPA_STAGE3_EXPERIMENT_NAME
+    experiment["model"]["config"].update(
+        repa_loss_weight=0.5,
+        repa_align_layer=20,
+        repa_projector_dim=2048,
+        repa_align_dim=1024,
+        repa_encoder_path=REPA_ENCODER,
+        repa_trd_margin=0.1,
+    )
+    # The align head is new and must be trained with the student.
+    experiment["optimizer"]["net"]["keys_to_select"] = [*_OPTIMIZER_KEYS, "repa_projector"]
+    return experiment

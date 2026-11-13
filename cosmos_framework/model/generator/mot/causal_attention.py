@@ -1547,6 +1547,10 @@ def three_way_attention_with_memory(
         else:
             video_v = video_v.clone()
             starts = video_pack_q_offsets[:-1].long()
+            # LOCAL PATCH (siyiche, 2026-11-09): skip packed segments shorter than one action supertoken,
+            # e.g. the 1-token placeholder added when clamping empty varlen K/V; indexing them overflows.
+            lengths = (video_pack_q_offsets[1:] - video_pack_q_offsets[:-1]).long()
+            starts = starts[lengths >= num_action_tokens]
             null_positions = (starts.unsqueeze(1) + torch.arange(num_action_tokens, device=starts.device)).reshape(-1)
             video_v[null_positions] = 0
 

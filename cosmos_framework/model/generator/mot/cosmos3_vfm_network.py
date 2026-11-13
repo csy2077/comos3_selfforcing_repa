@@ -70,6 +70,7 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
     from_all_seq,
     get_caption_seq_offsets,
     get_causal_seq,
+    get_all_seq_unpadded,
     get_full_only_seq,
 )
 from cosmos_framework.utils.generator.spatial_patch import normalize_spatial_patch_hw
@@ -122,9 +123,17 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         enable_input_bias: bool = True,
         lidar_patch_spatial_hw: int | tuple[int, int] | None = None,
         radar_patch_spatial_hw: int | tuple[int, int] | None = None,
+        # REPA align head (student only): project the generation tokens after decoder layer
+        # ``repa_align_layer`` (1-indexed) to ``repa_align_dim``. None disables it.
+        repa_align_layer: int | None = None,
+        repa_projector_dim: int = 2048,
+        repa_align_dim: int = 1024,
         **kwargs,
     ):
         self.vision_gen = vision_gen
+        self.repa_align_layer = repa_align_layer
+        self.repa_projector_dim = repa_projector_dim
+        self.repa_align_dim = repa_align_dim
         self.sound_gen = sound_gen
         self.vlm_config = vlm_config
         self.latent_patch_size = latent_patch_size
@@ -440,7 +449,51 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         self.config = config
         self.parallel_dims = None
 
+        # REPA: capture the hidden pack after one decoder layer, but only while
+        # ``repa_capture`` is on, so activation-checkpoint recomputation never overwrites it.
+        self.repa_capture = False
+        self._repa_hidden = None
+        self.repa_projector = None
+        repa_align_layer = getattr(config, "repa_align_layer", None)
+        if repa_align_layer:
+            if not 1 <= repa_align_layer <= self.num_hidden_layers:
+                raise ValueError(f"repa_align_layer={repa_align_layer} outside [1, {self.num_hidden_layers}]")
+            from cosmos_framework.model.generator.distillation.repa.losses import build_repa_projector
+
+            self.repa_projector = build_repa_projector(
+                self.hidden_size, config.repa_projector_dim, config.repa_align_dim
+            )
+            self.language_model.model.layers[repa_align_layer - 1].register_forward_hook(self._repa_capture_hook)
+
+    def _repa_capture_hook(self, module: nn.Module, args: tuple, output: tuple) -> None:
+        del module, args
+        if self.repa_capture:
+            self._repa_hidden = output[0]  # SequencePack after the align layer
+
+    def _repa_features(self, packed_seq: PackedSequence) -> list[torch.Tensor]:
+        """Projected align-layer features of the noisy vision tokens, one [T_n,h,w,D] per item."""
+        hidden_pack, self._repa_hidden = self._repa_hidden, None
+        if hidden_pack is None:
+            raise RuntimeError("repa_capture was on but the align layer produced no hidden state.")
+        if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+            raise NotImplementedError("REPA feature capture does not support context parallelism.")
+        vision = packed_seq.vision
+        assert vision is not None and isinstance(vision.mse_loss_indexes, torch.Tensor)
+        hidden = get_all_seq_unpadded(hidden_pack)  # [N_total,hidden_size]
+        feats = self.repa_projector(hidden[vision.mse_loss_indexes])  # [N_noisy,align_dim]
+        out, start = [], 0
+        for (_, h, w), noisy in zip(vision.token_shapes, vision.noisy_frame_indexes):
+            n = len(noisy) * h * w
+            out.append(feats[start : start + n].reshape(len(noisy), h, w, -1))  # [T_n,h,w,D]
+            start += n
+        return out
+
     def init_weights(self, buffer_device: torch.device | None):
+        if self.repa_projector is not None:
+            for layer in self.repa_projector:
+                if isinstance(layer, nn.Linear):
+                    layer.reset_parameters()
+
         if self.config.vision_gen or self.config.action_gen or self.config.sound_gen:
             self.time_embedder._init_weights(buffer_device=buffer_device)
 
@@ -1887,6 +1940,8 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             self._decode_sound(packed_seq, last_hidden_state, output_dict)
 
         output_dict.update(last_hidden_state=last_hidden_state)
+        if self.repa_capture:
+            output_dict["repa_features"] = self._repa_features(packed_seq)
         for lbl_metadata_key, lbl_metadata_value in lbl_metadata.items():
             output_dict.update({f"lbl_metadata_{lbl_metadata_key}": lbl_metadata_value})
         if self.predict_text_tokens:

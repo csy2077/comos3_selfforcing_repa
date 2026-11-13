@@ -624,6 +624,8 @@ class OmniMoTModel(ImaginaireModel):
                 sound_dim=self.config.sound_dim,
                 sound_latent_fps=self.config.sound_latent_fps,
                 enable_input_bias=self.config.enable_input_bias,
+                # Set only while a distillation model builds its student (e.g. the REPA align head).
+                **getattr(self, "_student_network_config_overrides", {}),
             )
             network_config._attn_implementation_internal = "eager"
             net = Cosmos3VFMNetwork(
@@ -7101,6 +7103,8 @@ class OmniMoTModel(ImaginaireModel):
             output_dict["preds_action"] = out_net["preds_action"]
         if self.config.sound_gen and "preds_sound" in out_net:
             output_dict["preds_sound"] = out_net["preds_sound"]
+        if "repa_features" in out_net:
+            output_dict["repa_features"] = out_net["repa_features"]
         for key, value in out_net.items():
             if "lbl_metadata_" in key:
                 output_dict[key] = value

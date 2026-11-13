@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import copy
 import json
 import math
@@ -18,6 +19,7 @@ from typing import Any, Literal
 import attrs
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
@@ -83,6 +85,7 @@ from cosmos_framework.data.generator.sequence_packing.autoregressive import (
     resolve_text_system_prompt,
 )
 from cosmos_framework.data.generator.sequence_packing.modality import compute_text_split_length
+from cosmos_framework.model.generator.distillation.repa.losses import encode_repa_target, token_relation_distillation
 from cosmos_framework.model.generator.distillation.optimizer import (
     PhaseOptimizer,
     PhaseScheduler,
@@ -154,6 +157,14 @@ class SelfForcingDMDConfig(OmniMoTCausalModelConfig):
     # truncation can leave their tokenized metadata and conditioning misaligned.
     # Preserve minimum-length synchronization for existing variable-length recipes.
     sf_require_equal_rollout_lengths: bool = False
+    # REPA (VideoREPA token-relation distillation) against a frozen OmniStream encoder of the
+    # real video, on the student's replayed exit step. 0 disables it.
+    repa_loss_weight: float = 0.0
+    repa_align_layer: int = 20  # student decoder layer (1-indexed) whose gen tokens are aligned
+    repa_projector_dim: int = 2048
+    repa_align_dim: int = 1024  # must equal the encoder width (OmniStream ViT-L = 1024)
+    repa_encoder_path: str = ""  # OmniStream checkpoint directory
+    repa_trd_margin: float = 0.1
 
     def __attrs_post_init__(self) -> None:
         if self.warmup_student_steps > 0 and self.warmup_critic_steps > 0:
@@ -182,6 +193,13 @@ class SelfForcingDMDConfig(OmniMoTCausalModelConfig):
                 "sf_streaming_long_tuning keeps only a bounded rolling KV cache and is incompatible with "
                 "sf_replayed_training, which replays against the complete rollout cache."
             )
+        if self.repa_loss_weight > 0.0:
+            if not self.sf_replayed_training or self.sf_streaming_long_tuning:
+                raise ValueError("REPA is implemented for replayed SF-DMD only (sf_replayed_training=True).")
+            if self.sf_rollout_backend != "causal_ar":
+                raise ValueError("REPA supports only the causal_ar rollout backend.")
+            if not self.repa_encoder_path:
+                raise ValueError("repa_loss_weight > 0 requires repa_encoder_path.")
         if self.sf_streaming_sequence_pixel_frames < 1:
             raise ValueError("sf_streaming_sequence_pixel_frames must be positive")
         if self.sf_streaming_step_latent_frames < 1:
@@ -219,6 +237,7 @@ class _CausalARReplayFrame:
     text_tokens: list[int] | None
     chunk_len: int = 1
     condition_frame_indexes_vision: tuple[int, ...] = ()
+    repa_features: torch.Tensor | None = None  # [chunk_len,h,w,D], detached rollout features (REPA)
 
 
 @dataclass
@@ -274,6 +293,10 @@ class _SelfForcingReplayContext:
     iteration: int
     sigmas_critic: torch.Tensor | None = None  # [B,T_vis] or None
     teacher_guidance: float = 1.0
+    # REPA: generated latent frames in order, their detached rollout features and encoder targets.
+    repa_frames: list[int] | None = None
+    repa_student_keys: torch.Tensor | None = None  # [T_gen,h*w,D], L2-normalized, detached
+    repa_target: torch.Tensor | None = None  # [T_gen,h*w,D], L2-normalized
 
 
 @dataclass
@@ -324,6 +347,7 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
         self._net_teacher_holder: list[torch.nn.Module] = []
         self._net_fake_score_holder: list[torch.nn.Module] = []
         self._phase_trainable_parameter_masks: dict[str, dict[str, bool]] | None = None
+        self._repa_encoder_holder: list[torch.nn.Module] = []
         super().__init__(config)
         self._streaming_long_state: _StreamingLongState | None = None
         self._streaming_critic_step: _StreamingLongStep | None = None
@@ -484,7 +508,27 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
         is_inference_mode = self._inference_mode_enabled()
         if not is_inference_mode:
             self.config.vlm_config.pretrained_weights.enabled = False
-        super().set_up_model()
+        repa_enabled = self.config.repa_loss_weight > 0.0 and not is_inference_mode
+        if repa_enabled:
+            # The align head lives on the student (and its EMA) only; teacher/critic are built below.
+            self._student_network_config_overrides = {
+                "repa_align_layer": self.config.repa_align_layer,
+                "repa_projector_dim": self.config.repa_projector_dim,
+                "repa_align_dim": self.config.repa_align_dim,
+            }
+        try:
+            super().set_up_model()
+        finally:
+            self._student_network_config_overrides = {}
+        if repa_enabled:
+            from cosmos_framework.model.generator.distillation.repa import build_align_encoder
+
+            # Frozen and outside the module registry: never sharded, optimized or checkpointed.
+            self._repa_encoder_holder = [
+                build_align_encoder(self.config.repa_encoder_path).to(
+                    device=self.tensor_kwargs["device"], dtype=torch.bfloat16
+                )
+            ]
 
         if is_inference_mode:
             log.info("[SF-DMD] inference mode: skipping teacher and fake-score networks.")
@@ -798,6 +842,7 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
             if gen_data_template.x0_tokens_vision is None or gen_data_template.x0_tokens_action is None:
                 raise ValueError("Camera-action streaming requires encoded vision and action tokens")
             vision_tokens = gen_data_template.x0_tokens_vision[0]
+            ## vision_tokens: the tokenized video/image
             expected_frames = self._streaming_long_spec.max_sequence_frames
             tcf = self.tokenizer_vision_gen.temporal_compression_factor or 4
             expected_actions = (expected_frames - 1) * tcf
@@ -1236,6 +1281,12 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
         checkpoint_keys = set(metadata.state_dict_metadata.keys())
         prefixed_model_keys = {f"{prefix}.{key}" for key in state_dict.keys()}
         missing_keys = sorted(key for key in prefixed_model_keys - checkpoint_keys if not key.endswith("_extra_state"))
+        # The REPA align head is new in this stage: earlier-stage checkpoints lack it as a whole,
+        # and it then keeps its fresh init. A partially present head is still an error.
+        repa_head_keys = {key for key in prefixed_model_keys if key.startswith(f"{prefix}.repa_projector.")}
+        if repa_head_keys and repa_head_keys <= set(missing_keys):
+            log.info(f"Checkpoint {ckpt_path} has no REPA align head; {len(repa_head_keys)} keys keep their init.")
+            missing_keys = [key for key in missing_keys if key not in repa_head_keys]
         if missing_keys:
             raise RuntimeError(
                 f"Self-forcing DMD checkpoint load is missing model keys; first missing keys: {missing_keys[:20]}"
@@ -1252,12 +1303,13 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
 
         prefixed_state_dict = collections.OrderedDict()
         for key in state_dict.keys():
-            prefixed_state_dict[f"{prefix}.{key}"] = state_dict[key]
+            if f"{prefix}.{key}" in checkpoint_keys:
+                prefixed_state_dict[f"{prefix}.{key}"] = state_dict[key]
         dcp.load(
             prefixed_state_dict, storage_reader=storage_reader, planner=DefaultLoadPlanner(allow_partial_load=True)
         )
-        for key in state_dict.keys():
-            state_dict[key] = prefixed_state_dict[f"{prefix}.{key}"]
+        for key in prefixed_state_dict.keys():
+            state_dict[key[len(prefix) + 1 :]] = prefixed_state_dict[key]
 
         log.info(set_model_state_dict(net, state_dict, options=StateDictOptions(strict=False)))
         del state_dict, prefixed_state_dict
@@ -1721,6 +1773,84 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
             ]
         return input_text_indexes, sequence_plans, gen_data_clean, data_resolutions, unconditional_text_indexes
 
+    # ---- REPA -----------------------------------------------------------------------------------
+    def _repa_enabled(self) -> bool:
+        return self.config.repa_loss_weight > 0.0 and bool(self._repa_encoder_holder)
+
+    @contextlib.contextmanager
+    def _repa_capture(self, enabled: bool) -> Iterator[None]:
+        """Make the student emit ``repa_features`` (projected align-layer tokens) for one forward."""
+        if not enabled:
+            yield
+            return
+        student = self.denoiser_nets["student"]
+        student.repa_capture = True
+        try:
+            yield
+        finally:
+            student.repa_capture = False
+            student._repa_hidden = None
+
+    def _build_repa_context(
+        self, gen_data_clean: GenerationDataClean, replay_state: _SelfForcingReplayState | None
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
+        """Detached student keys and encoder targets over every generated latent frame."""
+        if not isinstance(replay_state, _CausalARReplayState):
+            raise NotImplementedError("REPA supports the causal AR replay state only.")
+        if gen_data_clean.raw_state_vision is None or len(gen_data_clean.raw_state_vision) != 1:
+            raise RuntimeError(
+                "REPA needs the real video of exactly one vision item (gen_data_clean.raw_state_vision); "
+                "context parallelism and per-camera VAE encoding release it."
+            )
+        frames: list[int] = []
+        student_keys: list[torch.Tensor] = []
+        for frame in replay_state.frames:
+            if frame.repa_features is None:
+                raise RuntimeError(f"REPA: replay chunk at latent frame {frame.frame_idx} has no rollout features.")
+            if frame.condition_frame_indexes_vision:
+                raise NotImplementedError("REPA does not support replay chunks with conditioned frames.")
+            frames.extend(range(frame.frame_idx, frame.frame_idx + frame.chunk_len))
+            student_keys.append(frame.repa_features)  # [chunk_len,h,w,D]
+        keys = torch.cat(student_keys, dim=0).float()  # [T_gen,h,w,D]
+        T, h, w, D = keys.shape
+        target = encode_repa_target(
+            self._repa_encoder_holder[0],
+            gen_data_clean.raw_state_vision[0],
+            frames,
+            (h, w),
+            temporal_compression=self.tokenizer_vision_gen.temporal_compression_factor or 4,
+        ).to(keys.device)  # [T_gen,h,w,D_enc]
+        if target.shape[-1] != D:
+            raise ValueError(f"repa_align_dim={D} != encoder width {target.shape[-1]}")
+        keys = F.normalize(keys.reshape(T, h * w, D), dim=-1)
+        target = F.normalize(target.reshape(T, h * w, D), dim=-1)
+        return frames, keys, target
+
+    def _repa_replay_loss(
+        self, ctx: _SelfForcingReplayContext, frame_idx: int, chunk_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Full-video TRD with gradient through this chunk only.
+
+        The other chunks' features are the detached rollout keys, so summing the closures' gradients
+        gives exactly the gradient of the full-video loss (as in the reference, where every chunk's
+        exit step stays in one graph). The returned loss carries 1/N of the value per closure, so
+        the summed log equals one full-video loss; its gradient is the full partial w.r.t. this chunk.
+
+        Returns: (loss_for_backward, trd_value / N) -- both scalars; the trainer sums closure logs.
+        """
+        assert ctx.repa_frames is not None and ctx.repa_student_keys is not None and ctx.repa_target is not None
+        chunk_len = chunk_features.shape[0]
+        row = ctx.repa_frames.index(frame_idx)
+        if ctx.repa_frames[row : row + chunk_len] != list(range(frame_idx, frame_idx + chunk_len)):
+            raise RuntimeError(f"REPA: chunk at latent frame {frame_idx} is not contiguous in the rollout order.")
+        keys = ctx.repa_student_keys  # [T_gen,hw,D]
+        chunk = F.normalize(chunk_features.float().flatten(1, 2), dim=-1)  # [chunk_len,hw,D]
+        align = torch.cat([keys[:row], chunk, keys[row + chunk_len :]], dim=0)  # [T_gen,hw,D]
+        trd = token_relation_distillation(align, ctx.repa_target, self.config.repa_trd_margin)  # []
+        n_chunks = len(ctx.sim.replay_state.frames)  # type: ignore[union-attr]
+        loss = trd.detach() / n_chunks + (trd - trd.detach())
+        return loss, trd.detach() / n_chunks
+
     def training_step(self, data_batch: dict[str, Any], iteration: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         self._setup_grad_requirements(iteration)
         if self.config.sf_streaming_long_tuning:
@@ -1728,6 +1858,8 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
                 return self.training_step_generator_streaming(data_batch, iteration)
             return self.training_step_critic_streaming(data_batch, iteration)
 
+
+        ## what's the gen_data_clean?
         input_text_indexes, sequence_plans, gen_data_clean, data_resolutions, unconditional_text_indexes = (
             self._prepare_self_forcing_inputs(data_batch, iteration)
         )
@@ -1997,6 +2129,25 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
             gen_data_clean,
             effective_iteration=self.get_student_iteration(iteration),
         )
+        ## sim --> 
+        #                   return _SelfForcingSimulationResult(
+        #     gen_data_student=gen_data_student,
+        #     packed_reference=packed_reference,
+        #     sigma_student=sigma_student,
+        #     out_student=out_student,
+        #     replay_state=(
+        #         _CausalARReplayState(
+        #             frames=replay_frames,
+        #             dual_kv_cache=dual_kv_cache,
+        #             fps_vision_list=fps_vision_list,
+        #             fps_action_list=fps_action_list,
+        #             cached_text_offset=cached_text_offset,
+        #             force_action_tokens=force_action_tokens,
+        #         )
+        #         if collect_replay
+        #         else None
+        #     ),
+        # )
         gen_data_student = sim.gen_data_student
         packed_student = sim.packed_reference
         out_student = sim.out_student
@@ -2236,12 +2387,18 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
                 self._select_vision_items(fake_x0, generated_vision_item_indices),
                 noisy_mask_vision,
             )[0]  # [1,C,T,H,W]
+            repa_frames = repa_keys = repa_target = None
+            if self._repa_enabled():
+                repa_frames, repa_keys, repa_target = self._build_repa_context(gen_data_clean, sim.replay_state)
         return _SelfForcingReplayContext(
             sim=sim,
             target_vision=target_vision,
             iteration=iteration,
             sigmas_critic=sigmas_critic.detach(),
             teacher_guidance=teacher_guidance,
+            repa_frames=repa_frames,
+            repa_student_keys=repa_keys,
+            repa_target=repa_target,
         )
 
     def _replayed_sf_step(
@@ -2300,11 +2457,13 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
                 pack,
                 replay_frame.cache_metadata.to_memory_info(replay_state.dual_kv_cache, write_gen_cache=False),
             )
-        out_student = self.denoise(
-            net=self.denoiser_nets["student"],
-            data_batch_packed=pack,
-            memory=memory,
-        )
+        use_repa = ctx.repa_target is not None
+        with self._repa_capture(use_repa):
+            out_student = self.denoise(
+                net=self.denoiser_nets["student"],
+                data_batch_packed=pack,
+                memory=memory,
+            )
         velocity = self._single_vision_prediction(
             out_student["preds_vision"]
         ).float()  # [1,C,chunk_len,H,W] or [1,C,V*chunk_len,H,W]
@@ -2337,15 +2496,27 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
             replay_loss_mask[list(replay_frame.condition_frame_indexes_vision)] = 0.0
             per_camera_frame_loss = per_camera_frame_loss * replay_loss_mask  # [chunk_len]
         frame_loss = per_camera_frame_loss.sum()  # []
-        total_loss = self.config.loss_scale_sid * frame_loss  # []
+        vsd_term = self.config.loss_scale_sid * frame_loss  # []
+        total_loss = vsd_term
+        repa_trd = None
+        if use_repa:
+            repa_loss, repa_trd = self._repa_replay_loss(ctx, chunk_start, out_student["repa_features"][0])
+            total_loss = total_loss + self.config.repa_loss_weight * repa_loss  # []
+            if replay_index == len(replay_state.frames) - 1:
+                log.info(
+                    f"Iteration {ctx.iteration}, student phase, REPA trd loss (full video): "
+                    f"{repa_trd.item() * len(replay_state.frames):.6f}, weight {self.config.repa_loss_weight}"
+                )
         batch_size = int(ctx.sim.sigma_student.shape[0])
         output_batch = {
-            "vsd_loss": total_loss.detach(),
+            "vsd_loss": vsd_term.detach(),
             "total_generator_loss": total_loss.detach(),
             "dmd_loss_generator": total_loss.detach(),
-            "dmd_loss": total_loss.detach(),
-            "flow_matching_loss_vision_per_instance": total_loss.detach().expand(batch_size),
+            "dmd_loss": vsd_term.detach(),
+            "flow_matching_loss_vision_per_instance": vsd_term.detach().expand(batch_size),
         }
+        if repa_trd is not None:
+            output_batch["repa_trd_loss"] = repa_trd  # 1/N of the full-video value; closures sum to it
         if replay_index == 0 and ctx.sigmas_critic is not None:
             output_batch["sigma"] = ctx.sigmas_critic.detach()
             output_batch["teacher_guidance"] = torch.tensor(
@@ -3024,12 +3195,18 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
             memory = self.build_memory_state(
                 pack, resolved_cache_metadata.to_memory_info(dual_kv_cache, write_gen_cache=False)
             )
-            with torch.set_grad_enabled(enable_grad):
+            # REPA: the replayed step's input is exactly this one, so its align features double
+            # as the detached keys the replay closures relate their own (grad) features against.
+            capture_repa = collect_replay and self._repa_enabled() and step_idx == n_steps - grad_steps
+            with torch.set_grad_enabled(enable_grad), self._repa_capture(capture_repa):
                 out_student = self.denoise(
                     net=self.denoiser_nets["student"],
                     data_batch_packed=pack,
                     memory=memory,
                 )
+            if capture_repa:
+                out_student["repa_rollout_features"] = out_student.pop("repa_features")[0].detach()
+            ## here we can extract the align features
             velocity = self._single_vision_prediction(out_student["preds_vision"]).float()  # [1,C,1,H,W]
             sigma_cur_tensor = torch.as_tensor(sigma_cur, dtype=torch.float32, device=x_frame.device)  # []
             x0_pred = x_frame - sigma_cur_tensor * velocity  # [1,C,chunk_len,H,W]
@@ -3107,6 +3284,7 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
                     data_batch_packed=pack,
                     memory=memory,
                 )
+                ## here we can extract the align feature
             velocity = self._single_vision_prediction(out_student["preds_vision"]).float()  # [1,C,V*chunk_len,H,W]
             sigma_cur_tensor = torch.as_tensor(
                 sigma_cur,
@@ -3921,6 +4099,7 @@ class SelfForcingDMDModel(DMDTrainingBase, OmniMoTCausalModel):
                         text_tokens=chunk_text_tokens,
                         chunk_len=chunk_len,
                         cache_metadata=_SelfForcingCacheMetadata(cache_frame_idx=chunk_start),
+                        repa_features=out_student.get("repa_rollout_features"),
                     )
                 )
             # Split the joint chunk prediction back into per-frame outputs and seed each clean

@@ -8,8 +8,10 @@ from hydra.core.config_store import ConfigStore
 from cosmos_framework.configs.simulation.common.bimanual_profiles import (
     EXPERIMENT_NAMES,
     LOCAL_EXPERIMENT_NAMES,
+    REPA_STAGE3_EXPERIMENT_NAME,
     make_bimanual_experiment,
     make_local_bimanual_experiment,
+    make_local_bimanual_stage3_repa_experiment,
 )
 from cosmos_framework.utils.lazy_config import LazyDict
 
@@ -26,3 +28,9 @@ for _stage, _name in enumerate(EXPERIMENT_NAMES):
         name=LOCAL_EXPERIMENT_NAMES[_stage],
         node=LazyDict(make_local_bimanual_experiment(_stage), flags={"allow_objects": True}),
     )
+ConfigStore.instance().store(
+    group="experiment",
+    package="_global_",
+    name=REPA_STAGE3_EXPERIMENT_NAME,
+    node=LazyDict(make_local_bimanual_stage3_repa_experiment(), flags={"allow_objects": True}),
+)

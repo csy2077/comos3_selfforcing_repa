@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Stage 3 with REPA. Required: COSMOS_SIM_BIMANUAL_LOCAL_BUNDLE, COSMOS_SIM_BIMANUAL_STAGE0_CHECKPOINT,
+# COSMOS_SIM_BIMANUAL_STAGE2_CHECKPOINT, and COSMOS_SIM_BIMANUAL_REPA_ENCODER (OmniStream checkpoint dir).
+# Same as sim_bimanual_stage3_sfdmd plus a 0.5-weighted token-relation loss between the student's
+# layer-20 generation tokens and frozen OmniStream features of the real video.
+[job]
+task = "simulation"
+experiment = "sim_local_bimanual_stage3_sfdmd_repa"
+name = "sim_bimanual_stage3_sfdmd_repa"
+wandb_mode = "disabled"
